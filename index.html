@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Deep Live Cam — Avatar + Subtle Expressions</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/facemesh"></script>
+  <style>
+    :root{--teal:#0dd6cc;--teal-dark:#0a8b86;--bg:#071021}
+    html,body{height:100%;margin:0;background:linear-gradient(180deg,#071021,#000);font-family:Inter,system-ui,Segoe UI,Roboto,Arial;color:#e6eef6}
+    .wrap{max-width:1000px;margin:18px auto;padding:18px}
+    header{display:flex;align-items:center;justify-content:space-between;gap:12px}
+    h1{font-size:20px;margin:0}
+    .card{background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));border-radius:12px;padding:12px;box-shadow:0 8px 32px rgba(2,6,23,0.7)}
+    #camera-area{display:grid;grid-template-columns:1fr 320px;gap:14px;align-items:start;margin-top:12px}
+    #camera-box{position:relative;border-radius:10px;overflow:hidden;background:#000;min-height:360px}
+    video,canvas{display:block;width:100%;height:100%;object-fit:cover}
+    .controls{display:flex;flex-direction:column;gap:8px;padding:10px}
+    .row{display:flex;gap:8px;align-items:center}
+    button{background:linear-gradient(180deg,var(--teal),var(--teal-dark));border:0;padding:10px 12px;border-radius:8px;color:#002;cursor:pointer}
+    button[disabled]{opacity:.5;cursor:not-allowed}
+    select,input[type=file]{background:transparent;color:inherit;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.04)}
+    label{font-size:13px;color:#9fb7bf}
+    .muted{font-size:13px;color:#94a3b8}
+    .slider{width:100%}
+    footer{margin-top:12px;font-size:12px;color:#94a3b8}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Deep Live Cam — Subtle Avatar Expressions</h1>
+      <div class="muted">Local only · Privacy friendly</div>
+    </header>
+
+    <div id="camera-area">
+      <div id="camera-box" class="card">
+        <video id="webcam" autoplay playsinline muted style="display:none"></video>
+        <canvas id="outputCanvas"></canvas>
+      </div>
+
+      <aside class="card controls">
+        <div class="row">
+          <button id="startBtn">Start Camera</button>
+          <button id="stopBtn" disabled>Stop</button>
+        </div>
+
+        <div>
+          <label>Preset avatar</label>
+          <select id="presetAvatar">
+            <option value="">— none —</option>
+            <option value="cartoon">Cartoon</option>
+            <option value="emoji">Emoji</option>
+            <option value="cat">Cat</option>
+            <option value="robot">Robot</option>
+          </select>
+        </div>
+
+        <div>
+          <label>Upload avatar (PNG/SVG)</label>
+          <input id="avatarUpload" type="file" accept="image/*" />
+          <div id="avatarName" class="muted"></div>
+        </div>
+
+        <div>
+          <label>Expression Sensitivity: <span id="sensitivityVal">0.50</span></label>
+          <input id="sensitivity" class="slider" type="range" min="0" max="1" step="0.01" value="0.5" />
+        </div>
+
+        <div class="muted">Animations: blink, mouth movement, smile (subtle). Keypoints hidden.</div>
+      </aside>
+    </div>
+
+    <footer>Tip: For best results use a clear frontal camera and a stylized non‑photorealistic avatar.</footer>
+  </div>
+
+  <script>
+    // Elements
+    const video = document.getElementById('webcam');
+    const canvas = document.getElementById('outputCanvas');
+    const ctx = canvas.getContext('2d');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const presetAvatar = document.getElementById('presetAvatar');
+    const avatarUpload = document.getElementById('avatarUpload');
+    const avatarName = document.getElementById('avatarName');
+    const sensitivity = document.getElementById('sensitivity');
+    const sensitivityVal = document.getElementById('sensitivityVal');
+
+    // State
+    let stream = null;
+    let model = null;
+    let avatarImg = null;
+    let raf = null;
+    let lastTime = 0;
+
+    // Smoothed signals
+    let smoothBlink = 0; // 0..1 (1 = eyes open), blink value will be 0 when closed
+    let smoothSmile = 0; // 0..1
+    let smoothMouth = 0; // 0..1 (mouth open)
+
+    // Utility: linear interpolation
+    const lerp = (a,b,t)=> a + (b-a)*t;
+
+    // Setup small SVG presets as data URLs
+    const presets = {
+      cartoon: 'data:image/svg+xml;utf8,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="400" height="400"><rect width="100%" height="100%" fill="#ffd6e0"/><circle cx="200" cy="160" r="120" fill="#ffb3c6"/><circle cx="160" cy="150" r="10" fill="#2b2b2b"/><circle cx="240" cy="150" r="10" fill="#2b2b2b"/><path d="M140 250 q60 50 120 0" stroke="#2b2b2b" stroke-width="12" fill="none" stroke-linecap="round"/></svg>'),
+      emoji: 'data:image/svg+xml;utf8,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="400" height="400"><circle cx="200" cy="200" r="180" fill="#ffcc4d"/><circle cx="160" cy="170" r="14" fill="#000"/><circle cx="240" cy="170" r="14" fill="#000"/><path d="M130,250 Q200,300 270,250" stroke="#000" stroke-width="14" fill="none" stroke-linecap="round"/></svg>'),
+      cat: 'data:image/svg+xml;utf8,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="400" height="400"><polygon points="120,60 200,180 40,180" fill="#9CA3AF"/><polygon points="280,60 360,180 220,180" fill="#9CA3AF"/><circle cx="200" cy="220" r="140" fill="#9CA3AF" stroke="#374151" stroke-width="6"/><circle cx="150" cy="200" r="12" fill="#111"/><circle cx="250" cy="200" r="12" fill="#111"/><path d="M140,280 Q200,320 260,280" stroke="#111" stroke-width="10" fill="none"/></svg>'),
+      robot: 'data:image/svg+xml;utf8,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="400" height="400"><rect x="60" y="60" width="280" height="280" rx="36" fill="#94A3B8" stroke="#0f1724" stroke-width="6"/><circle cx="140" cy="170" r="18" fill="#071426"/><circle cx="260" cy="170" r="18" fill="#071426"/><rect x="150" y="260" width="100" height="14" rx="6" fill="#071426"/></svg>')
+    };
+
+    // Initialize model
+    async function initModel(){
+      model = await facemesh.load({ maxFaces: 1 });
+      console.log('FaceMesh ready');
+    }
+
+    async function startCamera(){
+      try{
+        stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' }, audio: false });
+        video.srcObject = stream; await video.play();
+        canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+        startBtn.disabled = true; stopBtn.disabled = false;
+        lastTime = performance.now();
+        runLoop();
+      }catch(e){
+        alert('Unable to access camera'); console.error(e);
+      }
+    }
+
+    function stopCamera(){
+      if(stream){ stream.getTracks().forEach(t=>t.stop()); stream = null }
+      if(raf) cancelAnimationFrame(raf); raf = null;
+      startBtn.disabled = false; stopBtn.disabled = true;
+      // clear canvas
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+    }
+
+    // Helper: get distance between two points
+    function dist(a,b){ const dx=a[0]-b[0], dy=a[1]-b[1]; return Math.hypot(dx,dy) }
+
+    // Main loop — throttled to ~24 fps by time delta
+    async function runLoop(ts){
+      raf = requestAnimationFrame(runLoop);
+      if(!model || video.readyState < 2) return;
+      const now = ts || performance.now();
+      const delta = now - lastTime;
+      const targetMs = 1000/24; // ~24fps
+      if(delta < targetMs) return; // skip
+      lastTime = now;
+
+      // draw camera
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      // run face mesh
+      const predictions = await model.estimateFaces({ input: video });
+      if(predictions.length === 0){ // decay smoothing
+        smoothBlink = lerp(smoothBlink, 1, 0.06);
+        smoothSmile = lerp(smoothSmile, 0, 0.06);
+        smoothMouth = lerp(smoothMouth, 0, 0.06);
+        return;
+      }
+
+      const keypoints = predictions[0].scaledMesh;
+      // landmarks indices (MediaPipe facemesh common indices)
+      const leftEyeTop = keypoints[159];
+      const leftEyeBottom = keypoints[145];
+      const rightEyeTop = keypoints[386];
+      const rightEyeBottom = keypoints[374];
+      const leftEyeOuter = keypoints[33];
+      const rightEyeOuter = keypoints[263];
+      const mouthTop = keypoints[13];
+      const mouthBottom = keypoints[14];
+      const mouthLeft = keypoints[61];
+      const mouthRight = keypoints[291];
+      const nose = keypoints[1];
+
+      // compute raw measures
+      const leftEyeOpenness = dist(leftEyeTop, leftEyeBottom);
+      const rightEyeOpenness = dist(rightEyeTop, rightEyeBottom);
+      const eyeOpenness = (leftEyeOpenness + rightEyeOpenness)/2;
+
+      const eyeWidth = dist(leftEyeOuter, rightEyeOuter);
+      const normalizedEye = eyeOpenness / (eyeWidth || 1);
+
+      const mouthOpen = dist(mouthTop, mouthBottom);
+      const mouthWidth = dist(mouthLeft, mouthRight);
+      const normalizedMouth = mouthOpen / (mouthWidth || 1);
+
+      // smile metric: mouth corners relative to lip center vertical offset
+      const mouthCornerDist = mouthWidth;
+      const smileMetric = mouthCornerDist / (eyeWidth || 1) - 0.45; // tuned offset
+
+      // sensitivity factor
+      const s = parseFloat(sensitivity.value);
+
+      // Map raw metrics to 0..1 ranges and smooth
+      const blinkTarget = Math.min(Math.max( (normalizedEye - 0.025)/0.02, 0), 1); // open -> larger
+      // we want smoothBlink = 1 when open, approach 0 when closed
+      smoothBlink = lerp(smoothBlink, blinkTarget, 0.18 * (1+s));
+
+      const mouthTarget = Math.min(Math.max((normalizedMouth - 0.02)/0.15, 0), 1);
+      smoothMouth = lerp(smoothMouth, mouthTarget * s, 0.12 + 0.08*s);
+
+      const smileTarget = Math.min(Math.max(smileMetric * 2.0, 0), 1);
+      smoothSmile = lerp(smoothSmile, smileTarget * s, 0.06 + 0.08*s);
+
+      // compute face rectangle
+      const left = Math.min(...keypoints.map(p=>p[0]));
+      const right = Math.max(...keypoints.map(p=>p[0]));
+      const top = Math.min(...keypoints.map(p=>p[1]));
+      const bottom = Math.max(...keypoints.map(p=>p[1]));
+      const faceW = (right - left);
+      const faceH = (bottom - top);
+      const cx = nose[0];
+      const cy = nose[1];
+
+      // draw avatar if available
+      if(avatarImg){
+        const baseW = faceW * 1.2; // avatar scaled slightly larger than face
+        const baseH = faceH * 1.25;
+        // subtle mouth-driven vertical scale
+        const mouthScale = 1 + (smoothMouth * 0.08); // up to 8%
+        // subtle smile-driven vertical translate
+        const smileOffset = smoothSmile * - (faceH * 0.02);
+
+        ctx.save();
+        // center avatar on nose
+        const drawX = cx - baseW/2;
+        const drawY = cy - baseH/2 + (smileOffset);
+        // apply subtle mouth-based scale around center
+        ctx.translate(cx, cy);
+        ctx.scale(1, mouthScale);
+        ctx.translate(-cx, -cy);
+        ctx.drawImage(avatarImg, drawX, drawY, baseW, baseH);
+        ctx.restore();
+
+        // draw soft eyelid overlays to simulate blink
+        // eyelid opacity increases when eyes close -> derived from (1 - smoothBlink)
+        const eyelidOpacity = (1 - smoothBlink) * 0.95; // up to 0.95
+        if(eyelidOpacity > 0.01){
+          ctx.save();
+          ctx.globalAlpha = eyelidOpacity;
+          ctx.fillStyle = 'rgba(7,8,10,0.95)';
+          // compute eye rectangles in canvas coords
+          const eyeW = eyeWidth * 0.9;
+          const eyeH = eyeWidth * 0.25;
+          // left eye center
+          const leftEyeCenterX = (leftEyeOuter[0] + leftEyeTop[0] + leftEyeBottom[0]) / 3;
+          const leftEyeCenterY = (leftEyeTop[1] + leftEyeBottom[1]) / 2;
+          const rightEyeCenterX = (rightEyeOuter[0] + rightEyeTop[0] + rightEyeBottom[0]) / 3;
+          const rightEyeCenterY = (rightEyeTop[1] + rightEyeBottom[1]) / 2;
+          // draw rounded rects
+          drawRoundedRect(ctx, leftEyeCenterX - eyeW/2, leftEyeCenterY - eyeH/2, eyeW, eyeH, eyeH/2);
+          drawRoundedRect(ctx, rightEyeCenterX - eyeW/2, rightEyeCenterY - eyeH/2, eyeW, eyeH, eyeH/2);
+          ctx.fill();
+          ctx.restore();
+        }
+
+        // small smile highlight — draw translucent arc near mouth when smiling subtly
+        if(smoothSmile > 0.02){
+          ctx.save(); ctx.globalAlpha = smoothSmile * 0.6; ctx.strokeStyle = 'rgba(255,255,255,0.65)'; ctx.lineWidth = Math.max(2, faceW*0.004);
+          const mx = (mouthLeft[0] + mouthRight[0]) / 2; const my = (mouthTop[1] + mouthBottom[1]) / 2 + faceH*0.02;
+          drawRoundedSmile(ctx, mx, my, faceW*0.26, 0.6);
+          ctx.restore();
+        }
+      }
+    }
+
+    // helpers
+    function drawRoundedRect(ctx,x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+    function drawRoundedSmile(ctx, cx, cy, width, curvature){ ctx.beginPath(); ctx.arc(cx, cy, width, Math.PI*0.15, Math.PI*0.85, false); ctx.stroke(); }
+
+    // event handlers & UI
+    startBtn.addEventListener('click', async ()=>{ await startCamera(); });
+    stopBtn.addEventListener('click', ()=>{ stopCamera(); });
+
+    avatarUpload.addEventListener('change', (e)=>{
+      const f = e.target.files && e.target.files[0]; if(!f) return;
+      const url = URL.createObjectURL(f); const img = new Image(); img.onload = ()=>{ avatarImg = img; URL.revokeObjectURL(url); avatarName.textContent = f.name }; img.src = url; presetAvatar.value = '';
+    });
+
+    presetAvatar.addEventListener('change', (e)=>{
+      const val = e.target.value; if(!val){ avatarImg = null; avatarName.textContent = ''; return; }
+      avatarImg = new Image(); avatarImg.src = presets[val]; avatarName.textContent = val.charAt(0).toUpperCase() + val.slice(1) + ' (preset)';
+    });
+
+    sensitivity.addEventListener('input', ()=>{ sensitivityVal.textContent = parseFloat(sensitivity.value).toFixed(2); });
+
+    // initialize
+    initModel();
+  </script>
+</body>
+</html>
